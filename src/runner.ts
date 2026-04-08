@@ -225,7 +225,7 @@ export async function ensureProjectClaudeMd(): Promise<void> {
 }
 
 function buildSecurityArgs(security: SecurityConfig): string[] {
-  const args: string[] = ["--dangerously-skip-permissions"];
+  const args: string[] = [];
 
   switch (security.level) {
     case "locked":
@@ -238,7 +238,8 @@ function buildSecurityArgs(security: SecurityConfig): string[] {
       // all tools available, scoped to project dir via system prompt
       break;
     case "unrestricted":
-      // all tools, no directory restriction
+      // all tools, no directory restriction — bypass permission prompts
+      args.push("--dangerously-skip-permissions");
       break;
   }
 
