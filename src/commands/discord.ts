@@ -107,6 +107,8 @@ let resumeGatewayUrl: string | null = null;
 let heartbeatAcked = true;
 let running = true;
 let discordDebug = false;
+// Dedup: track recently processed message IDs to prevent double-handling on reconnect/resume
+const recentMessageIds = new Set<string>();
 
 // Bot identity (populated from READY)
 let botUserId: string | null = null;
@@ -487,6 +489,18 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
   // Ignore bot messages
   if (message.author.bot) return;
+
+  // Dedup: skip if we've already processed this message (reconnect/resume replay)
+  if (recentMessageIds.has(message.id)) {
+    debugLog(`Skipping duplicate MESSAGE_CREATE id=${message.id}`);
+    return;
+  }
+  recentMessageIds.add(message.id);
+  // Keep set bounded — drop old IDs after 500 entries
+  if (recentMessageIds.size > 500) {
+    const first = recentMessageIds.values().next().value;
+    if (first) recentMessageIds.delete(first);
+  }
 
   const userId = message.author.id;
   const channelId = message.channel_id;
@@ -1201,13 +1215,24 @@ function connectGateway(token: string, url?: string): void {
   const gatewayUrl = url || GATEWAY_URL;
   debugLog(`Connecting to gateway: ${gatewayUrl}`);
 
-  ws = new WebSocket(gatewayUrl);
+  // Close existing connection explicitly before creating new one
+  if (ws && ws.readyState !== WebSocket.CLOSED) {
+    ws.onmessage = null;
+    ws.onclose = null;
+    ws.onerror = null;
+    ws.close(1000, "Replacing connection");
+  }
 
-  ws.onopen = () => {
+  const socket = new WebSocket(gatewayUrl);
+  ws = socket;
+
+  socket.onopen = () => {
     debugLog("Gateway WebSocket opened");
   };
 
-  ws.onmessage = (event) => {
+  socket.onmessage = (event) => {
+    // Ignore events from stale connections
+    if (ws !== socket) return;
     try {
       const payload = JSON.parse(String(event.data)) as GatewayPayload;
       handleGatewayPayload(token, payload);
@@ -1216,7 +1241,9 @@ function connectGateway(token: string, url?: string): void {
     }
   };
 
-  ws.onclose = (event) => {
+  socket.onclose = (event) => {
+    // Ignore close events from stale connections
+    if (ws !== socket) return;
     debugLog(`Gateway closed: code=${event.code} reason=${event.reason}`);
     stopHeartbeat();
     if (!running) return;
@@ -1241,7 +1268,7 @@ function connectGateway(token: string, url?: string): void {
     }
   };
 
-  ws.onerror = () => {
+  socket.onerror = () => {
     // onclose will fire after onerror, reconnection handled there
   };
 }
