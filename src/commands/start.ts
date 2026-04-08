@@ -10,6 +10,7 @@ import { initConfig, loadSettings, reloadSettings, resolvePrompt, type Heartbeat
 import { getDayAndMinuteAtOffset } from "../timezone";
 import { startWebUi, type WebServerHandle } from "../web";
 import type { Job } from "../jobs";
+import { registerPermission, resolvePermission, getPending, onBroadcast } from "../permissions";
 
 const CLAUDE_DIR = join(process.cwd(), ".claude");
 const HEARTBEAT_DIR = join(CLAUDE_DIR, "claudeclaw");
@@ -190,6 +191,37 @@ async function teardownStatusline() {
     await unlink(STATUSLINE_FILE);
   } catch {
     // already gone
+  }
+}
+
+// --- Permission hook installation ---
+
+const PERMISSION_HOOK_PATH = fileURLToPath(new URL("../../hooks/permission-hook.ts", import.meta.url));
+const PERMISSION_HOOK_COMMAND = `bun run ${PERMISSION_HOOK_PATH.replace(/\\/g, "/")}`;
+
+async function installPermissionHook() {
+  let settings: Record<string, any> = {};
+  try {
+    settings = await Bun.file(CLAUDE_SETTINGS_FILE).json();
+  } catch {
+    // file doesn't exist yet — will be created
+  }
+
+  if (!settings.hooks) settings.hooks = {};
+  if (!Array.isArray(settings.hooks.PermissionRequest)) {
+    settings.hooks.PermissionRequest = [];
+  }
+
+  // Check if already installed
+  const already = settings.hooks.PermissionRequest.some(
+    (h: any) => typeof h?.command === "string" && h.command.includes("permission-hook.ts"),
+  );
+  if (!already) {
+    settings.hooks.PermissionRequest.push({
+      type: "command",
+      command: PERMISSION_HOOK_COMMAND,
+    });
+    await writeFile(CLAUDE_SETTINGS_FILE, JSON.stringify(settings, null, 2) + "\n");
   }
 }
 
@@ -464,6 +496,13 @@ export async function start(args: string[] = []) {
           onChat: async (message, onChunk, onUnblock) => {
             await streamUserMessage("chat", message, onChunk, onUnblock);
           },
+          onPermissionRegister: ({ id, toolName, toolInput }) => {
+            registerPermission({ id, toolName, toolInput }).then((decision) => {
+              if (web) web.notifyPermissionDecision(id, decision);
+            }).catch(() => {});
+          },
+          onPermissionResolve: (id, decision) => resolvePermission(id, decision),
+          getPermissionPending: () => getPending(),
         });
       } catch (err) {
         lastError = err;
@@ -480,6 +519,38 @@ export async function start(args: string[] = []) {
     currentSettings.web.port = web.port;
     console.log(`[${new Date().toLocaleTimeString()}] Web UI listening on http://${web.host}:${web.port}`);
   }
+
+  // --- Permission broadcasters ---
+  // Discord: send to all listenChannels
+  onBroadcast(async (perm) => {
+    if (!currentSettings.discord.token) return;
+    const channelIds = currentSettings.discord.listenChannels;
+    if (!channelIds.length) return;
+    try {
+      const { sendPermissionRequest: discordSendPerm } = await import("./discord");
+      await discordSendPerm(currentSettings.discord.token, channelIds, perm);
+    } catch (err) {
+      console.error(`[Permissions] Discord broadcast error:`, err);
+    }
+  });
+
+  // Telegram: send to all allowedUserIds
+  onBroadcast(async (perm) => {
+    if (!currentSettings.telegram.token) return;
+    const chatIds = currentSettings.telegram.allowedUserIds;
+    if (!chatIds.length) return;
+    try {
+      const { sendPermissionRequest: telegramSendPerm } = await import("./telegram");
+      await telegramSendPerm(currentSettings.telegram.token, chatIds, perm);
+    } catch (err) {
+      console.error(`[Permissions] Telegram broadcast error:`, err);
+    }
+  });
+
+  // --- Install permission hook into .claude/settings.json ---
+  installPermissionHook().catch((err) => {
+    console.error(`[Permissions] Failed to install hook:`, err);
+  });
 
   // --- Helpers ---
   function ts() { return new Date().toLocaleTimeString(); }

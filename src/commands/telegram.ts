@@ -874,6 +874,43 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
   const config = getSettings().telegram;
   const data = query.data ?? "";
 
+  // Permission pattern: "perm_allow_<8hex>" or "perm_deny_<8hex>"
+  const permMatch = data.match(/^perm_(allow|deny)_([0-9a-f]{8})$/);
+  if (permMatch) {
+    const action = permMatch[1] as "allow" | "deny";
+    const permId = permMatch[2];
+    let answerText = "⚠️ Server error";
+    try {
+      const webPort = getSettings().web.port ?? 4632;
+      const resp = await fetch(`http://127.0.0.1:${webPort}/api/permission/resolve/${permId}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ decision: action }),
+      });
+      const result = await resp.json() as { ok: boolean };
+      answerText = result.ok
+        ? action === "allow" ? "✅ Allowed" : "❌ Denied"
+        : "⚠️ Not found (already resolved or timed out)";
+      if (query.message && result.ok) {
+        const statusLine = action === "allow" ? "\n\n✅ Allowed" : "\n\n❌ Denied";
+        const newText = (query.message.text ?? "").replace(/\n\n[✅❌].*$/s, "") + statusLine;
+        await callApi(config.token, "editMessageText", {
+          chat_id: query.message.chat.id,
+          message_id: query.message.message_id,
+          text: newText,
+          // No reply_markup → removes the inline keyboard
+        }).catch(() => {});
+      }
+    } catch {
+      // server not running or error
+    }
+    await callApi(config.token, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: answerText,
+    }).catch(() => {});
+    return;
+  }
+
   // Secretary pattern: "sec_yes_<8hex>" or "sec_no_<8hex>"
   const secMatch = data.match(/^sec_(yes|no)_([0-9a-f]{8})$/);
   if (secMatch) {
@@ -1024,6 +1061,47 @@ async function poll(): Promise<void> {
 
 /** Send a message to a specific chat (used by heartbeat forwarding) */
 export { sendMessage };
+
+/** Send a permission request message with Allow/Deny inline keyboard buttons */
+export async function sendPermissionRequest(
+  token: string,
+  chatIds: number[],
+  perm: { id: string; toolName: string; toolInput: unknown },
+): Promise<{ chatId: number; messageId: number }[]> {
+  const inputStr = JSON.stringify(perm.toolInput ?? {}, null, 2);
+  const truncated = inputStr.length > 800 ? inputStr.slice(0, 800) + "\n..." : inputStr;
+  const text =
+    `🔐 <b>Permission Request</b>\n` +
+    `Tool: <code>${perm.toolName}</code>\n` +
+    `Input:\n<pre><code>${truncated.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")}</code></pre>`;
+
+  const reply_markup = {
+    inline_keyboard: [
+      [
+        { text: "✅ Allow", callback_data: `perm_allow_${perm.id}` },
+        { text: "❌ Deny", callback_data: `perm_deny_${perm.id}` },
+      ],
+    ],
+  };
+
+  const results: { chatId: number; messageId: number }[] = [];
+  for (const chatId of chatIds) {
+    try {
+      const res = await callApi<{ ok: boolean; result: { message_id: number } }>(token, "sendMessage", {
+        chat_id: chatId,
+        text,
+        parse_mode: "HTML",
+        reply_markup,
+      });
+      if (res.ok) {
+        results.push({ chatId, messageId: res.result.message_id });
+      }
+    } catch {
+      // ignore per-chat errors
+    }
+  }
+  return results;
+}
 
 process.on("SIGTERM", () => { running = false; });
 process.on("SIGINT", () => { running = false; });

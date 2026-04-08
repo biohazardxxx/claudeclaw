@@ -7,6 +7,9 @@ import { createQuickJob, deleteJob } from "./services/jobs";
 import { readLogs } from "./services/logs";
 
 export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
+  // Local map for permission decisions so the poll loop can detect them
+  const permDecisions = new Map<string, "allow" | "deny">();
+
   const server = Bun.serve({
     hostname: opts.host,
     port: opts.port,
@@ -191,6 +194,62 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
         }
       }
 
+      // --- Permission API ---
+
+      if (url.pathname === "/api/permission/request" && req.method === "POST") {
+        if (!opts.onPermissionRegister) return json({ ok: false, error: "permissions not configured" });
+        try {
+          const body = await req.json() as { toolName?: unknown; toolInput?: unknown };
+          const toolName = String(body.toolName ?? "unknown");
+          const toolInput = body.toolInput ?? {};
+          // Generate a short hex id
+          const id = Math.floor(Math.random() * 0xffffffff).toString(16).padStart(8, "0");
+          // We can't call registerPermission here (no import), so we emit via a callback
+          // The actual registration happens in start.ts via onPermissionRegister
+          if (opts.onPermissionRegister) {
+            opts.onPermissionRegister({ id, toolName, toolInput });
+          }
+          return json({ ok: true, id });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
+      if (url.pathname.startsWith("/api/permission/poll/") && req.method === "GET") {
+        const id = url.pathname.slice("/api/permission/poll/".length);
+        if (!id) return json({ ok: false, error: "id required" });
+
+        // Long-poll: wait up to 20s for a decision
+        const deadline = Date.now() + 20_000;
+        while (Date.now() < deadline) {
+          const decision = permDecisions.get(id);
+          if (decision) {
+            permDecisions.delete(id);
+            return json({ decision });
+          }
+          await Bun.sleep(500);
+        }
+        return json({ pending: true });
+      }
+
+      if (url.pathname.startsWith("/api/permission/resolve/") && req.method === "POST") {
+        if (!opts.onPermissionResolve) return json({ ok: false, error: "permissions not configured" });
+        const id = url.pathname.slice("/api/permission/resolve/".length);
+        try {
+          const body = await req.json() as { decision?: unknown };
+          const decision = body.decision === "allow" ? "allow" : "deny";
+          const ok = opts.onPermissionResolve(id, decision);
+          return json({ ok });
+        } catch (err) {
+          return json({ ok: false, error: String(err) });
+        }
+      }
+
+      if (url.pathname === "/api/permission/pending" && req.method === "GET") {
+        const items = opts.getPermissionPending ? opts.getPermissionPending() : [];
+        return json({ pending: items });
+      }
+
       return new Response("Not found", { status: 404 });
     },
   });
@@ -199,5 +258,8 @@ export function startWebUi(opts: StartWebUiOptions): WebServerHandle {
     stop: () => server.stop(),
     host: opts.host,
     port: server.port,
+    notifyPermissionDecision: (id: string, decision: "allow" | "deny") => {
+      permDecisions.set(id, decision);
+    },
   };
 }

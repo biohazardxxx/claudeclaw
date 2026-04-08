@@ -13,6 +13,7 @@ export interface WebServerHandle {
   stop: () => void;
   host: string;
   port: number;
+  notifyPermissionDecision: (id: string, decision: "allow" | "deny") => void;
 }
 
 export interface StartWebUiOptions {
@@ -32,4 +33,7 @@ export interface StartWebUiOptions {
     onChunk: (text: string) => void,
     onUnblock: () => void
   ) => Promise<void>;
+  onPermissionResolve?: (id: string, decision: "allow" | "deny") => boolean;
+  getPermissionPending?: () => unknown[];
+  onPermissionRegister?: (perm: { id: string; toolName: string; toolInput: unknown }) => void;
 }

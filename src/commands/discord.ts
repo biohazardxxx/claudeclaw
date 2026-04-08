@@ -184,6 +184,65 @@ async function sendMessage(
   }
 }
 
+async function sendPermissionRequestToChannel(
+  token: string,
+  channelId: string,
+  perm: { id: string; toolName: string; toolInput: unknown },
+): Promise<{ channelId: string; messageId: string } | null> {
+  const inputStr = JSON.stringify(perm.toolInput ?? {}, null, 2);
+  const truncated = inputStr.length > 800 ? inputStr.slice(0, 800) + "\n..." : inputStr;
+  const content =
+    `🔐 **Permission Request**\n` +
+    `Tool: \`${perm.toolName}\`\n` +
+    `Input:\n\`\`\`json\n${truncated}\n\`\`\``;
+
+  const components = [
+    {
+      type: 1, // ACTION_ROW
+      components: [
+        {
+          type: 2, // BUTTON
+          style: 3, // SUCCESS (green)
+          label: "Allow",
+          custom_id: `perm_allow_${perm.id}`,
+        },
+        {
+          type: 2, // BUTTON
+          style: 4, // DANGER (red)
+          label: "Deny",
+          custom_id: `perm_deny_${perm.id}`,
+        },
+      ],
+    },
+  ];
+
+  const MAX_LEN = 2000;
+  const normalized = content.slice(0, MAX_LEN);
+  try {
+    const msg = await discordApi<{ id: string }>(token, "POST", `/channels/${channelId}/messages`, {
+      content: normalized,
+      components,
+    });
+    return { channelId, messageId: msg.id };
+  } catch {
+    return null;
+  }
+}
+
+/** Send a permission request to all configured channels and return message IDs */
+export async function sendPermissionRequest(
+  token: string,
+  channelIds: string[],
+  perm: { id: string; toolName: string; toolInput: unknown },
+): Promise<{ channelId: string; messageId: string }[]> {
+  const results: { channelId: string; messageId: string }[] = [];
+  for (const channelId of channelIds) {
+    const r = await sendPermissionRequestToChannel(token, channelId, perm);
+    if (r) results.push(r);
+  }
+  return results;
+}
+
 async function sendMessageToUser(
   token: string,
   userId: string,
@@ -799,6 +858,48 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
   // Button interactions (type 3) — secretary workflow
   if (interaction.type === 3 && interaction.data?.custom_id) {
     const customId = interaction.data.custom_id;
+
+    // Permission pattern: "perm_allow_<8hex>" or "perm_deny_<8hex>"
+    const permMatch = customId.match(/^perm_(allow|deny)_([0-9a-f]{8})$/);
+    if (permMatch) {
+      const action = permMatch[1] as "allow" | "deny";
+      const permId = permMatch[2];
+      let responseText = "Server error";
+
+      try {
+        const webPort = getSettings().web.port ?? 4632;
+        const resp = await fetch(`http://127.0.0.1:${webPort}/api/permission/resolve/${permId}`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ decision: action }),
+        });
+        const result = (await resp.json()) as { ok: boolean };
+        responseText = result.ok
+          ? action === "allow" ? "✅ Allowed" : "❌ Denied"
+          : "Not found (already resolved or timed out)";
+
+        // Edit original message to remove buttons and show outcome
+        if (interaction.message && result.ok) {
+          const outcomeText = action === "allow"
+            ? `${interaction.message.content}\n\n✅ **Allowed** by <@${interaction.member?.user?.id ?? interaction.user?.id}>`
+            : `${interaction.message.content}\n\n❌ **Denied** by <@${interaction.member?.user?.id ?? interaction.user?.id}>`;
+          await discordApi(
+            config.token,
+            "PATCH",
+            `/channels/${interaction.message.channel_id}/messages/${interaction.message.id}`,
+            { content: outcomeText, components: [] },
+          ).catch(() => {});
+        }
+      } catch {
+        // server not running
+      }
+
+      await respondToInteraction(interaction, {
+        content: responseText,
+        flags: 64, // EPHEMERAL
+      });
+      return;
+    }
 
     // Secretary pattern: "sec_yes_<8hex>" or "sec_no_<8hex>"
     const secMatch = customId.match(/^sec_(yes|no)_([0-9a-f]{8})$/);
