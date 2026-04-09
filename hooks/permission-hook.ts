@@ -7,19 +7,26 @@ import { readFileSync, existsSync } from "fs";
 import { join } from "path";
 
 const SETTINGS_PATH = join(process.cwd(), ".claude", "claudeclaw", "settings.json");
+const STATE_PATH = join(process.cwd(), ".claude", "claudeclaw", "state.json");
 const DEFAULT_PORT = 4632;
 
 function getPort(): number {
+  // Check settings.json first
   try {
     if (existsSync(SETTINGS_PATH)) {
-      const raw = readFileSync(SETTINGS_PATH, "utf8");
-      const parsed = JSON.parse(raw);
+      const parsed = JSON.parse(readFileSync(SETTINGS_PATH, "utf8"));
       const port = parsed?.web?.port;
       if (typeof port === "number" && port > 0 && port < 65536) return port;
     }
-  } catch {
-    // fall through to default
-  }
+  } catch { /* fall through */ }
+  // Fall back to state.json (daemon writes its actual port here)
+  try {
+    if (existsSync(STATE_PATH)) {
+      const parsed = JSON.parse(readFileSync(STATE_PATH, "utf8"));
+      const port = parsed?.web?.port;
+      if (typeof port === "number" && port > 0 && port < 65536) return port;
+    }
+  } catch { /* fall through */ }
   return DEFAULT_PORT;
 }
 
