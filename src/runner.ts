@@ -11,6 +11,7 @@ import {
 import { getSettings, type ModelConfig, type SecurityConfig } from "./config";
 import { buildClockPromptPrefix } from "./timezone";
 import { selectModel } from "./model-router";
+import { sendToPool } from "./processPool";
 
 const LOGS_DIR = join(process.cwd(), ".claude/claudeclaw/logs");
 // Resolve prompts relative to the claudeclaw installation, not the project dir
@@ -546,6 +547,151 @@ export async function run(name: string, prompt: string, threadId?: string): Prom
   return enqueue(() => execClaude(name, prompt, threadId), threadId);
 }
 
+/**
+ * Like execClaude but uses a persistent pooled process instead of spawning fresh.
+ * The system prompt is passed once at spawn time; subsequent messages are sent via stdin.
+ * Intended for user-initiated messages (Discord/Telegram) where session continuity and
+ * permission hooks matter.  Cron/heartbeat jobs continue to use execClaude (one-shot -p).
+ */
+async function execPersistent(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+  await mkdir(LOGS_DIR, { recursive: true });
+
+  const existing = threadId ? await getThreadSession(threadId) : await getSession();
+  const isNew = !existing;
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const logFile = join(LOGS_DIR, `${name}-${timestamp}.log`);
+
+  const settings = getSettings();
+  const { security, model, api, agentic } = settings;
+  const fallbackConfig: ModelConfig = {
+    model: settings.fallback?.model ?? "",
+    api: settings.fallback?.api ?? "",
+  };
+
+  let primaryConfig: ModelConfig;
+  let taskType = "unknown";
+  let routingReasoning = "";
+
+  if (agentic.enabled) {
+    const routing = selectModel(prompt, agentic.modes, agentic.defaultMode);
+    primaryConfig = { model: routing.model, api };
+    taskType = routing.taskType;
+    routingReasoning = routing.reasoning;
+    console.log(
+      `[${new Date().toLocaleTimeString()}] Agentic routing: ${routing.taskType} → ${routing.model} (${routing.reasoning})`
+    );
+  } else {
+    primaryConfig = { model, api };
+  }
+
+  const securityArgs = buildSecurityArgs(security);
+
+  console.log(
+    `[${new Date().toLocaleTimeString()}] Running (persistent): ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
+  );
+
+  // Build system prompt — passed once at spawn, not re-sent per message
+  const promptContent = await loadPrompts();
+  const appendParts: string[] = ["You are running inside ClaudeClaw."];
+  if (promptContent) appendParts.push(promptContent);
+
+  if (existsSync(PROJECT_CLAUDE_MD)) {
+    try {
+      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
+      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
+    } catch (e) {
+      console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
+    }
+  }
+
+  if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
+
+  const spawnArgs = [
+    "claude",
+    "--output-format", "stream-json",
+    "--verbose",
+    ...securityArgs,
+  ];
+
+  if (appendParts.length > 0) {
+    spawnArgs.push("--append-system-prompt", appendParts.join("\n\n"));
+  }
+
+  // Add model flag (same logic as runClaudeOnce)
+  const normalizedModel = primaryConfig.model.trim().toLowerCase();
+  if (primaryConfig.model.trim() && normalizedModel !== "glm") {
+    spawnArgs.push("--model", primaryConfig.model.trim());
+  }
+
+  const { CLAUDECODE: _, ...cleanEnv } = process.env;
+  const baseEnv = buildChildEnv(cleanEnv as Record<string, string>, primaryConfig.model, api);
+
+  const poolKey = threadId ?? "global";
+
+  let poolResult: { text: string; sessionId?: string };
+  try {
+    poolResult = await sendToPool(poolKey, prompt, {
+      spawnArgs,
+      env: baseEnv,
+      existingSessionId: existing?.sessionId ?? null,
+    });
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[${new Date().toLocaleTimeString()}] Pool error for ${name}:`, message);
+    return { stdout: "", stderr: message, exitCode: 1 };
+  }
+
+  const stdout = poolResult.text;
+  let sessionId = existing?.sessionId ?? "unknown";
+
+  // New session: save the session ID returned from the pool init event
+  if (isNew && poolResult.sessionId) {
+    sessionId = poolResult.sessionId;
+    if (threadId) {
+      await createThreadSession(threadId, sessionId);
+      console.log(`[${new Date().toLocaleTimeString()}] Thread session created (persistent): ${sessionId} (thread ${threadId.slice(0, 8)})`);
+    } else {
+      await createSession(sessionId);
+      console.log(`[${new Date().toLocaleTimeString()}] Session created (persistent): ${sessionId}`);
+    }
+  }
+
+  const runResult: RunResult = { stdout, stderr: "", exitCode: 0 };
+
+  const output = [
+    `# ${name}`,
+    `Date: ${new Date().toISOString()}`,
+    `Session: ${sessionId} (${isNew ? "new" : "resumed"}, persistent)`,
+    `Model config: primary`,
+    ...(agentic.enabled ? [`Task type: ${taskType}`, `Routing: ${routingReasoning}`] : []),
+    `Prompt: ${prompt}`,
+    `Exit code: 0`,
+    "",
+    "## Output",
+    stdout,
+  ].join("\n");
+
+  await Bun.write(logFile, output);
+  console.log(`[${new Date().toLocaleTimeString()}] Done: ${name} → ${logFile}`);
+
+  // Turn tracking & compact warning (same as execClaude)
+  if (!isNew) {
+    const turnCount = threadId ? await incrementThreadTurn(threadId) : await incrementTurn();
+    console.log(`[${new Date().toLocaleTimeString()}] Turn count: ${turnCount}${threadId ? ` (thread ${threadId.slice(0, 8)})` : ""}`);
+
+    if (turnCount >= COMPACT_WARN_THRESHOLD && existing && !existing.compactWarned) {
+      if (threadId) {
+        await markThreadCompactWarned(threadId);
+      } else {
+        await markCompactWarned();
+      }
+      emitCompactEvent({ type: "warn", turnCount });
+    }
+  }
+
+  return runResult;
+}
+
 async function streamClaude(
   name: string,
   prompt: string,
@@ -689,7 +835,7 @@ function prefixUserMessageWithClock(prompt: string): string {
 }
 
 export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return run(name, prefixUserMessageWithClock(prompt), threadId);
+  return enqueue(() => execPersistent(name, prefixUserMessageWithClock(prompt), threadId), threadId);
 }
 
 /**
