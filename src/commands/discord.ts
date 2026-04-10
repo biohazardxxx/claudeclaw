@@ -685,6 +685,14 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
 
     // Build prompt (same pattern as Telegram)
     const promptParts = [`[Discord from ${label}]`];
+
+    // Include replied-to message context if this is a reply
+    if (message.referenced_message?.content?.trim()) {
+      const refAuthor = message.referenced_message.author?.username ?? "unknown";
+      const refContent = message.referenced_message.content.trim();
+      promptParts.push(`Replying to [${refAuthor}]: ${refContent}`);
+    }
+
     if (skillContext) {
       const args = cleanContent.trim().slice(command!.length).trim();
       promptParts.push(`<command-name>${command}</command-name>`);
