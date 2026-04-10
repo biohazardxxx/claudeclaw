@@ -352,6 +352,15 @@ export function getSettings(): Settings {
   return cached;
 }
 
+/** Update the model field in settings.json and reload the in-memory cache. */
+export async function updateSettingsModel(model: string): Promise<void> {
+  const rawText = await Bun.file(SETTINGS_FILE).text();
+  const raw = JSON.parse(rawText);
+  raw.model = model;
+  await Bun.write(SETTINGS_FILE, JSON.stringify(raw, null, 2) + "\n");
+  cached = parseSettings(raw, extractDiscordUserIds(rawText));
+}
+
 const PROMPT_EXTENSIONS = [".md", ".txt", ".prompt"];
 
 /**

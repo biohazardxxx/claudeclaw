@@ -1,5 +1,5 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, updateSettingsModel } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { listThreadSessions, removeThreadSession, peekThreadSession } from "../sessionManager";
 import { readFile } from "node:fs/promises";
@@ -452,6 +452,11 @@ async function registerSlashCommands(token: string): Promise<void> {
       description: "Show context window usage",
       type: 1,
     },
+    {
+      name: "model",
+      description: "Switch the active Claude model",
+      type: 1,
+    },
   ];
 
   await discordApi(
@@ -872,6 +877,27 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
       return;
     }
 
+    if (interaction.data.name === "model") {
+      const current = getSettings().model || "sonnet";
+      const models = [
+        { id: "haiku", label: "🐇 Haiku 4.5", desc: "fast" },
+        { id: "sonnet", label: "⚡ Sonnet 4.6", desc: "default" },
+        { id: "opus", label: "🧠 Opus 4.6", desc: "powerful" },
+      ];
+      const buttons = models.map((m) => ({
+        type: 2, // BUTTON
+        style: m.id === current ? 1 : 2, // PRIMARY if current, SECONDARY otherwise
+        label: m.id === current ? `${m.label} ✓` : m.label,
+        custom_id: `model_set_${m.id}`,
+      }));
+      await respondToInteraction(interaction, {
+        content: `Current model: **${current}**\nSelect a model:`,
+        flags: 64,
+        components: [{ type: 1, components: buttons }],
+      });
+      return;
+    }
+
     // Unknown command
     await respondToInteraction(interaction, { content: "Unknown command." });
     return;
@@ -946,6 +972,18 @@ async function handleInteractionCreate(token: string, interaction: DiscordIntera
       await respondToInteraction(interaction, {
         content: responseText,
         flags: 64, // EPHEMERAL
+      });
+      return;
+    }
+
+    // Model selection: "model_set_<name>"
+    const modelMatch = customId.match(/^model_set_(haiku|sonnet|opus)$/);
+    if (modelMatch) {
+      const modelName = modelMatch[1];
+      await updateSettingsModel(modelName);
+      await respondToInteraction(interaction, {
+        content: `Model switched to **${modelName}**. Takes effect on the next message.`,
+        flags: 64,
       });
       return;
     }

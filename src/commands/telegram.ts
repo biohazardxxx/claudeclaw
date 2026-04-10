@@ -1,5 +1,5 @@
 import { ensureProjectClaudeMd, run, runUserMessage, compactCurrentSession } from "../runner";
-import { getSettings, loadSettings } from "../config";
+import { getSettings, loadSettings, updateSettingsModel } from "../config";
 import { resetSession, peekSession } from "../sessions";
 import { readFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -707,6 +707,31 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
     return;
   }
 
+  if (command === "/model") {
+    const current = getSettings().model || "sonnet";
+    const models = [
+      { id: "haiku", label: "🐇 Haiku 4.5 (fast)" },
+      { id: "sonnet", label: "⚡ Sonnet 4.6 (default)" },
+      { id: "opus", label: "🧠 Opus 4.6 (powerful)" },
+    ];
+    const keyboard = {
+      inline_keyboard: [
+        models.map((m) => ({
+          text: m.id === current ? `${m.label} ✓` : m.label,
+          callback_data: `model_set_${m.id}`,
+        })),
+      ],
+    };
+    await callApi(config.token, "sendMessage", {
+      chat_id: chatId,
+      message_thread_id: threadId,
+      text: `Current model: *${current}*\nSelect a model:`,
+      parse_mode: "Markdown",
+      reply_markup: keyboard,
+    });
+    return;
+  }
+
   // Secretary: detect reply to a bot alert message → treat as custom reply
   const replyToMsgId = message.reply_to_message?.message_id;
   if (replyToMsgId && text && botId && message.reply_to_message?.from?.id === botId) {
@@ -773,7 +798,7 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
 
     // Skill routing: resolve slash commands to SKILL.md prompts
     let skillContext: string | null = null;
-    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context") {
+    if (command && command !== "/start" && command !== "/reset" && command !== "/compact" && command !== "/status" && command !== "/context" && command !== "/model") {
       try {
         skillContext = await resolveSkillPrompt(command);
         if (skillContext) {
@@ -940,6 +965,26 @@ async function handleCallbackQuery(query: TelegramCallbackQuery): Promise<void> 
     return;
   }
 
+  // Model selection: "model_set_<name>"
+  const modelMatch = data.match(/^model_set_(haiku|sonnet|opus)$/);
+  if (modelMatch) {
+    const modelName = modelMatch[1];
+    await updateSettingsModel(modelName);
+    if (query.message) {
+      await callApi(config.token, "editMessageText", {
+        chat_id: query.message.chat.id,
+        message_id: query.message.message_id,
+        text: `Model switched to *${modelName}*. Takes effect on the next message.`,
+        parse_mode: "Markdown",
+      }).catch(() => {});
+    }
+    await callApi(config.token, "answerCallbackQuery", {
+      callback_query_id: query.id,
+      text: `✓ Model: ${modelName}`,
+    }).catch(() => {});
+    return;
+  }
+
   // Default: ack with no text
   await callApi(config.token, "answerCallbackQuery", { callback_query_id: query.id }).catch(() => {});
 }
@@ -955,6 +1000,7 @@ async function registerBotCommands(token: string): Promise<void> {
       { command: "compact", description: "Compact session to reduce context size" },
       { command: "status", description: "Show current session status" },
       { command: "context", description: "Show context window usage" },
+      { command: "model", description: "Switch active Claude model" },
     ];
     for (const skill of skills) {
       // Telegram commands: 1-32 chars, lowercase a-z, 0-9, underscores only
@@ -977,7 +1023,7 @@ async function registerBotCommands(token: string): Promise<void> {
     } catch (regErr) {
       // Skill-generated commands may violate Telegram constraints; retry with built-in commands only
       console.warn(`[Telegram] Full command registration failed, retrying with built-in commands only: ${regErr instanceof Error ? regErr.message : regErr}`);
-      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context"].includes(c.command));
+      const builtinOnly = commands.filter((c) => ["start", "reset", "compact", "status", "context", "model"].includes(c.command));
       await callApi(token, "setMyCommands", { commands: builtinOnly });
       console.log(`  Commands registered (built-in only): ${builtinOnly.length}`);
     }
