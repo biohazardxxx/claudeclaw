@@ -421,6 +421,66 @@ async function downloadDiscordAttachment(
   return localPath;
 }
 
+// --- Session context builder ---
+
+interface DiscordChannel {
+  id: string;
+  type: number;
+  name?: string;
+  topic?: string;
+  guild_id?: string;
+  parent_id?: string;
+}
+
+interface DiscordGuildInfo {
+  id: string;
+  name: string;
+}
+
+async function buildDiscordSessionContext(
+  token: string,
+  channelId: string,
+  guildId: string | undefined,
+  isDM: boolean,
+  isThread: boolean,
+  username: string,
+): Promise<string> {
+  const lines = ["[Session info]", "Platform: Discord"];
+
+  if (isDM) {
+    lines.push("Channel type: Direct Message");
+    lines.push(`User: ${username}`);
+    return lines.join("\n");
+  }
+
+  try {
+    const ch = await discordApi<DiscordChannel>(token, "GET", `/channels/${channelId}`);
+    const channelTypes: Record<number, string> = {
+      0: "text", 2: "voice", 4: "category", 5: "announcement",
+      10: "announcement thread", 11: "public thread", 12: "private thread",
+      13: "stage", 15: "forum", 16: "media",
+    };
+    const chType = channelTypes[ch.type] ?? `type ${ch.type}`;
+    lines.push(`Channel type: ${isThread ? "thread" : chType}`);
+    if (ch.name) lines.push(`Channel: #${ch.name}`);
+    if (ch.topic) lines.push(`Topic: ${ch.topic}`);
+  } catch {
+    lines.push(isThread ? "Channel type: thread" : "Channel type: text");
+  }
+
+  if (guildId) {
+    try {
+      const guild = await discordApi<DiscordGuildInfo>(token, "GET", `/guilds/${guildId}`);
+      lines.push(`Server: ${guild.name}`);
+    } catch {
+      // guild fetch failed — skip
+    }
+  }
+
+  lines.push(`User: ${username}`);
+  return lines.join("\n");
+}
+
 // --- Slash command registration ---
 
 async function registerSlashCommands(token: string): Promise<void> {
@@ -724,7 +784,17 @@ async function handleMessageCreate(token: string, message: DiscordMessage): Prom
     const prefixedPrompt = promptParts.join("\n");
     // Use thread-specific session if message is in a known thread
     const threadId = knownThreads.has(channelId) ? channelId : undefined;
-    const result = await runUserMessage("discord", prefixedPrompt, threadId);
+
+    // Inject session context on new sessions only
+    const existingSession = threadId ? await peekThreadSession(threadId) : await peekSession();
+    let sessionContext: string | undefined;
+    if (!existingSession) {
+      sessionContext = await buildDiscordSessionContext(
+        config.token, channelId, message.guild_id, isDM, !!threadId, label,
+      );
+    }
+
+    const result = await runUserMessage("discord", prefixedPrompt, threadId, sessionContext);
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, channelId, `Error (exit ${result.exitCode}): ${result.stderr || result.stdout || "Unknown error"}`);

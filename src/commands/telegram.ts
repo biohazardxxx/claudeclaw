@@ -83,7 +83,7 @@ interface TelegramMessage {
   message_id: number;
   from?: TelegramUser;
   reply_to_message?: { message_id?: number; from?: TelegramUser };
-  chat: { id: number; type: string };
+  chat: { id: number; type: string; title?: string; username?: string };
   message_thread_id?: number;
   text?: string;
   caption?: string;
@@ -857,7 +857,27 @@ async function handleMessage(message: TelegramMessage): Promise<void> {
       );
     }
     const prefixedPrompt = promptParts.join("\n");
-    const result = await runUserMessage("telegram", prefixedPrompt);
+
+    // Inject session context on new sessions only
+    let sessionContext: string | undefined;
+    const existingSession = await peekSession();
+    if (!existingSession) {
+      const contextLines = ["[Session info]", "Platform: Telegram"];
+      const chatTypeLabel: Record<string, string> = {
+        private: "Direct Message",
+        group: "Group",
+        supergroup: "Supergroup",
+        channel: "Channel",
+      };
+      contextLines.push(`Chat type: ${chatTypeLabel[chatType] ?? chatType}`);
+      if (message.chat.title) contextLines.push(`Chat name: ${message.chat.title}`);
+      if (message.chat.username) contextLines.push(`Chat username: @${message.chat.username}`);
+      contextLines.push(`User: ${label}`);
+      if (threadId) contextLines.push(`Thread ID: ${threadId}`);
+      sessionContext = contextLines.join("\n");
+    }
+
+    const result = await runUserMessage("telegram", prefixedPrompt, undefined, sessionContext);
 
     if (result.exitCode !== 0) {
       await sendMessage(config.token, chatId, `Error (exit ${result.exitCode}): ${result.stderr || "Unknown error"}`, threadId);

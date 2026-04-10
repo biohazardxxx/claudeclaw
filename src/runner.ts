@@ -345,7 +345,7 @@ export async function compactCurrentSession(): Promise<{ success: boolean; messa
     : { success: false, message: `❌ Compact failed (${existing.sessionId.slice(0, 8)})` };
 }
 
-async function execClaude(name: string, prompt: string, threadId?: string): Promise<RunResult> {
+async function execClaude(name: string, prompt: string, threadId?: string, sessionContext?: string): Promise<RunResult> {
   await mkdir(LOGS_DIR, { recursive: true });
 
   const existing = threadId
@@ -389,30 +389,21 @@ async function execClaude(name: string, prompt: string, threadId?: string): Prom
   // New session: use json output to capture Claude's session_id
   // Resumed session: use text output with --resume
   const outputFormat = isNew ? "json" : "text";
-  const args = ["claude", "-p", prompt, "--output-format", outputFormat, ...securityArgs];
+  const effectivePrompt = isNew && sessionContext ? `${sessionContext}\n\n${prompt}` : prompt;
+  const args = ["claude", "-p", effectivePrompt, "--output-format", outputFormat, ...securityArgs];
 
   if (!isNew) {
     args.push("--resume", existing.sessionId);
   }
 
-  // Build the appended system prompt: prompt files + directory scoping
-  // This is passed on EVERY invocation (not just new sessions) because
-  // --append-system-prompt does not persist across --resume.
-  const promptContent = await loadPrompts();
+  // Build the appended system prompt.
+  // NOTE: Claude already loads CLAUDE.md natively from the project root,
+  // so we do NOT re-inject prompt templates or CLAUDE.md here — that caused
+  // duplication and stale blank templates polluting the context.
+  // Only add ClaudeClaw operational context and security scoping.
   const appendParts: string[] = [
     "You are running inside ClaudeClaw.",
   ];
-  if (promptContent) appendParts.push(promptContent);
-
-  // Load the project's CLAUDE.md if it exists
-  if (existsSync(PROJECT_CLAUDE_MD)) {
-    try {
-      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
-      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
-    }
-  }
 
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
   if (appendParts.length > 0) {
@@ -590,20 +581,7 @@ async function execPersistent(name: string, prompt: string, threadId?: string): 
     `[${new Date().toLocaleTimeString()}] Running (persistent): ${name} (${isNew ? "new session" : `resume ${existing.sessionId.slice(0, 8)}`}, security: ${security.level})`
   );
 
-  // Build system prompt — passed once at spawn, not re-sent per message
-  const promptContent = await loadPrompts();
   const appendParts: string[] = ["You are running inside ClaudeClaw."];
-  if (promptContent) appendParts.push(promptContent);
-
-  if (existsSync(PROJECT_CLAUDE_MD)) {
-    try {
-      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
-      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
-    } catch (e) {
-      console.error(`[${new Date().toLocaleTimeString()}] Failed to read project CLAUDE.md:`, e);
-    }
-  }
-
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
 
   const spawnArgs = [
@@ -711,17 +689,7 @@ async function streamClaude(
 
   if (existing) args.push("--resume", existing.sessionId);
 
-  const promptContent = await loadPrompts();
   const appendParts: string[] = ["You are running inside ClaudeClaw."];
-  if (promptContent) appendParts.push(promptContent);
-
-  if (existsSync(PROJECT_CLAUDE_MD)) {
-    try {
-      const claudeMd = await Bun.file(PROJECT_CLAUDE_MD).text();
-      if (claudeMd.trim()) appendParts.push(claudeMd.trim());
-    } catch {}
-  }
-
   if (security.level !== "unrestricted") appendParts.push(DIR_SCOPE_PROMPT);
   if (appendParts.length > 0) {
     args.push("--append-system-prompt", appendParts.join("\n\n"));
@@ -834,8 +802,11 @@ function prefixUserMessageWithClock(prompt: string): string {
   }
 }
 
-export async function runUserMessage(name: string, prompt: string, threadId?: string): Promise<RunResult> {
-  return enqueue(() => execPersistent(name, prefixUserMessageWithClock(prompt), threadId), threadId);
+export async function runUserMessage(name: string, prompt: string, threadId?: string, sessionContext?: string): Promise<RunResult> {
+  // NOTE: execPersistent (process pool) is broken — claude in interactive
+  // stream-json mode does not emit `result` events between turns when stdin
+  // stays open.  Fall back to one-shot `-p` mode until that's resolved.
+  return enqueue(() => execClaude(name, prefixUserMessageWithClock(prompt), threadId, sessionContext), threadId);
 }
 
 /**
